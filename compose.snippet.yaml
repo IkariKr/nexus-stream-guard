@@ -1,0 +1,18 @@
+# Stream Guard Compose snippet for /volume2/docker/cliproxyapi/
+services:
+  cliproxyapi-stream-guard:
+    build:
+      context: ./stream-guard
+      dockerfile: Dockerfile
+    image: cliproxyapi-stream-guard:v1.0
+    container_name: cliproxyapi-stream-guard
+    restart: always
+    environment:
+      - HOST=0.0.0.0
+      - PORT=18318
+      - UPSTREAM_BASE_URL=http://cli-proxy-api:8317
+      - UPSTREAM_VERIFY=false
+      - READ_TIMEOUT=600.0
+      - LOG_LEVEL=INFO
+    networks:
+      - default
