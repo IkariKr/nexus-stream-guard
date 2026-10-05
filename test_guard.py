@@ -1,6 +1,6 @@
 """Comprehensive automated test suite for Nexus Stream Guard.
 
-Covers all 28 test scenarios:
+Covers all 29 test scenarios:
 - Scenario A: output_item.done -> response.completed
 - Scenario A Heuristic: reasoning-only -> response.failed(stream_truncated_after_reasoning)
 - Scenario B: function_call_arguments.delta -> response.failed(stream_truncated_tool_args)
@@ -10,6 +10,7 @@ Covers all 28 test scenarios:
 - Scenario F: normal stream with completed -> passed through without synthesis
 - Forward Compat: normal stream with incomplete -> passed through without synthesis
 - Trailing Error Suppression: event: error (unexpected EOF) after message completed -> suppressed and synthesized response.completed
+- Non-whitelisted Real Business Error NOT Suppressed: event: error (context_length_exceeded) -> normalized into response.failed even if item closed
 - Midstream Error Normalization: event: error during delta -> normalized into response.failed
 - Upstream Error Passthrough: HTTP 401/500/response.failed -> passed through untouched
 - Default Reject: unmapped last event -> response.failed(stream_closed_unclean_default_reject)
@@ -135,6 +136,7 @@ class TestNexusStreamGuardPolicies(unittest.TestCase):
         )
         dec = evaluate_disconnection(ctx)
         self.assertEqual(dec.action, "synthesize_failed")
+        self.assertEqual(dec.event_name, "response.failed")
         self.assertEqual(dec.payload["response"]["error"]["code"], "stream_truncated_text")
 
     def test_scenario_d_reasoning_truncated(self):
@@ -145,6 +147,7 @@ class TestNexusStreamGuardPolicies(unittest.TestCase):
         )
         dec = evaluate_disconnection(ctx)
         self.assertEqual(dec.action, "synthesize_failed")
+        self.assertEqual(dec.event_name, "response.failed")
         self.assertEqual(dec.payload["response"]["error"]["code"], "stream_truncated_reasoning")
 
     def test_scenario_e_empty_stream(self):
@@ -155,6 +158,7 @@ class TestNexusStreamGuardPolicies(unittest.TestCase):
         )
         dec = evaluate_disconnection(ctx)
         self.assertEqual(dec.action, "synthesize_failed")
+        self.assertEqual(dec.event_name, "response.failed")
         self.assertEqual(dec.payload["response"]["error"]["code"], "stream_empty_or_premature")
 
     def test_scenario_f_terminal_already_present(self):
@@ -227,6 +231,16 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
                     yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"delta":"Gemini output complete"}\n\n'
                     yield b'event: response.output_item.done\ndata: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"msg_gemini","type":"message","status":"completed"}}\n\n'
                     yield b'event: error\ndata: {"type":"error","code":"internal_server_error","message":"unexpected EOF","sequence_number":0}\n\n'
+                    return
+
+                elif scenario == "scenario_trailing_real_error":
+                    # Emit full output, but followed by a REAL business error (e.g. context_length_exceeded)
+                    # This MUST NOT be suppressed, because subsequent tools were discarded by the upstream!
+                    yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_real_err","model":"gemini","created_at":123}}\n\n'
+                    yield b'event: response.output_item.added\ndata: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message"}}\n\n'
+                    yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"delta":"Message before limit"}\n\n'
+                    yield b'event: response.output_item.done\ndata: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"msg_gemini","type":"message","status":"completed"}}\n\n'
+                    yield b'event: error\ndata: {"type":"error","code":"context_length_exceeded","message":"Context length exceeded"}\n\n'
                     return
 
                 elif scenario == "scenario_midstream_error":
@@ -346,14 +360,21 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
     def test_e2e_trailing_error_suppressed_and_completed(self):
         events, payloads, status, _ = self._call_guard("scenario_trailing_error")
         self.assertEqual(status, 200)
-        # Verify that "error" event was suppressed!
         self.assertNotIn("error", events)
-        # Verify that terminal event is response.completed
         self.assertEqual(events[-1], "response.completed")
         last_p = payloads[-1]
         self.assertEqual(last_p["type"], "response.completed")
         self.assertEqual(last_p["response"]["id"], "resp_trailing_err")
         self.assertEqual(len(last_p["response"]["output"]), 1)
+
+    def test_e2e_trailing_real_error_not_suppressed(self):
+        events, payloads, status, _ = self._call_guard("scenario_trailing_real_error")
+        self.assertEqual(status, 200)
+        # Real error MUST NOT be suppressed into a fake completed!
+        self.assertNotIn("response.completed", events)
+        self.assertEqual(events[-1], "response.failed")
+        last_p = payloads[-1]
+        self.assertEqual(last_p["response"]["error"]["code"], "context_length_exceeded")
 
     def test_e2e_midstream_error_normalized(self):
         events, payloads, status, _ = self._call_guard("scenario_midstream_error")

@@ -9,14 +9,14 @@ import json
 import logging
 import os
 import sys
-from typing import AsyncGenerator, Dict, Set
+from typing import AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
-from .policies import StreamContext, evaluate_disconnection
+from .policies import StreamContext, build_failed_payload, evaluate_disconnection
 
 # Hop-by-hop & compression headers to filter out between proxies
 HOP_BY_HOP_HEADERS: Set[str] = {
@@ -31,6 +31,17 @@ HOP_BY_HOP_HEADERS: Set[str] = {
     "content-length",
     "host",
     "content-encoding",  # Prevent downstream gunzip mismatch when body is already decoded
+}
+
+# Whitelist of network-level false-positive errors eligible for trailing suppression
+TRAILING_SUPPRESSION_ERR_WHITELIST: Set[str] = {
+    "unexpected eof",
+    "eof",
+    "stream closed",
+    "connection reset",
+    "connection closed",
+    "broken pipe",
+    "network error",
 }
 
 logging.basicConfig(
@@ -138,6 +149,70 @@ async def proxy_router(request: Request, path: str):
     return await handle_streaming_responses(request, upstream_path, req_headers, body, requested_model)
 
 
+def is_network_level_eof_error(err_msg: str, err_code: str) -> bool:
+    """Check if error is an EOF / connection-drop artifact eligible for suppression."""
+    msg = (err_msg or "").lower()
+    code = (err_code or "").lower()
+    return any(p in msg for p in TRAILING_SUPPRESSION_ERR_WHITELIST) or any(
+        p in code for p in TRAILING_SUPPRESSION_ERR_WHITELIST
+    )
+
+
+def process_event_block(
+    event_name: str, lines: List[str], ctx: StreamContext
+) -> Tuple[Optional[bytes], Optional[bytes], bool]:
+    """Process a completed SSE event block.
+    
+    Returns:
+        (output_bytes, buffered_done_bytes, should_stop_stream)
+    """
+    if event_name == "error":
+        # Check if terminal event already sent
+        if ctx.has_terminal_event:
+            return None, None, False
+
+        err_msg = "Upstream stream error"
+        err_code = "upstream_stream_error"
+        for el in lines:
+            if el.startswith("data:"):
+                try:
+                    p = json.loads(el[5:].strip())
+                    err_msg = p.get("message") or p.get("error", {}).get("message") or err_msg
+                    err_code = p.get("code") or p.get("error", {}).get("code") or err_code
+                except Exception:
+                    pass
+
+        # Whitelist suppression: only suppress EOF-like network errors after substantive output closed
+        if (
+            ctx.has_substantive_closed_output()
+            and not ctx.in_active_delta
+            and is_network_level_eof_error(err_msg, err_code)
+        ):
+            logger.info(
+                f"Suppressed false-positive trailing 'event: error' block after completed substantive output "
+                f"[{err_code}: {err_msg}] (resp_id={ctx.response_id}, items={len(ctx.completed_output_items)})"
+            )
+            ctx.error_suppressed = True
+            return None, None, False
+
+        # Real error: normalize into standard response.failed and stop stream
+        logger.warning(
+            f"Upstream emitted non-suppressed 'event: error' [{err_code}: {err_msg}]. Normalizing to response.failed."
+        )
+        norm_failed = build_failed_payload(ctx, code=err_code, message=err_msg)
+        ctx.has_terminal_event = True
+        out = f"event: response.failed\ndata: {json.dumps(norm_failed)}\n\n".encode("utf-8")
+        return out, None, True
+
+    # Check for standalone [DONE] marker
+    if len(lines) == 1 and lines[0] == "data: [DONE]":
+        done_bytes = ("\n".join(lines) + "\n\n").encode("utf-8")
+        return None, done_bytes, False
+
+    out = ("\n".join(lines) + "\n\n").encode("utf-8")
+    return out, None, False
+
+
 async def handle_streaming_responses(
     request: Request, upstream_path: str, req_headers: Dict[str, str], body: bytes, requested_model: str = ""
 ) -> Response:
@@ -175,7 +250,7 @@ async def handle_streaming_responses(
     async def sse_event_guard_generator() -> AsyncGenerator[bytes, None]:
         ctx = StreamContext(model=requested_model)
         current_event_name = ""
-        current_chunk_lines = []
+        current_chunk_lines: List[str] = []
         buffered_done_block: bytes = b""
 
         try:
@@ -183,58 +258,17 @@ async def handle_streaming_responses(
                 line = raw_line.strip()
                 if not line:
                     if current_chunk_lines:
-                        # Check for non-standard "event: error" (e.g. CLIProxyAPI's unexpected EOF on closed stream)
-                        if current_event_name == "error":
-                            if ctx.has_substantive_closed_output() and not ctx.in_active_delta:
-                                logger.info(
-                                    f"Suppressed false-positive trailing 'event: error' block after completed substantive output "
-                                    f"[resp_id={ctx.response_id}, items={len(ctx.completed_output_items)}]"
-                                )
-                                ctx.error_suppressed = True
-                                current_chunk_lines = []
-                                current_event_name = ""
-                                continue
-                            else:
-                                # Real failure during mid-stream: normalize into standard response.failed
-                                logger.warning(
-                                    f"Upstream emitted 'event: error' during active stream. Normalizing to response.failed."
-                                )
-                                err_msg = "Upstream stream error"
-                                err_code = "upstream_stream_error"
-                                for el in current_chunk_lines:
-                                    if el.startswith("data:"):
-                                        try:
-                                            p = json.loads(el[5:].strip())
-                                            err_msg = p.get("message") or p.get("error", {}).get("message") or err_msg
-                                            err_code = p.get("code") or p.get("error", {}).get("code") or err_code
-                                        except Exception:
-                                            pass
-                                norm_failed = {
-                                    "type": "response.failed",
-                                    "sequence_number": ctx.max_sequence_number + 1,
-                                    "response": {
-                                        "id": ctx.response_id or "resp_failed_norm",
-                                        "status": "failed",
-                                        "error": {"message": err_msg, "type": "upstream_stream_error", "code": err_code},
-                                        "model": ctx.model or "unknown",
-                                        "output": ctx.completed_output_items,
-                                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-                                    }
-                                }
-                                ctx.has_terminal_event = True
-                                yield f"event: response.failed\ndata: {json.dumps(norm_failed)}\n\n".encode("utf-8")
-                                current_chunk_lines = []
-                                current_event_name = ""
-                                continue
-
-                        block = "\n".join(current_chunk_lines) + "\n\n"
-                        # If block is solely [DONE], buffer it to output after any synthetic terminal event
-                        if len(current_chunk_lines) == 1 and current_chunk_lines[0] == "data: [DONE]":
-                            buffered_done_block = block.encode("utf-8")
-                        else:
-                            yield block.encode("utf-8")
+                        out_block, done_block, should_stop = process_event_block(
+                            current_event_name, current_chunk_lines, ctx
+                        )
+                        if done_block:
+                            buffered_done_block = done_block
+                        if out_block:
+                            yield out_block
                         current_chunk_lines = []
-                        current_event_name = ""  # Reset event name per event block
+                        current_event_name = ""
+                        if should_stop:
+                            return
                     continue
 
                 current_chunk_lines.append(line)
@@ -251,15 +285,16 @@ async def handle_streaming_responses(
                             pass
 
             if current_chunk_lines:
-                if current_event_name == "error" and ctx.has_substantive_closed_output() and not ctx.in_active_delta:
-                    logger.info("Suppressed false-positive trailing 'event: error' block in final chunk.")
-                    ctx.error_suppressed = True
-                elif len(current_chunk_lines) == 1 and current_chunk_lines[0] == "data: [DONE]":
-                    buffered_done_block = "\n".join(current_chunk_lines).encode("utf-8") + b"\n\n"
-                else:
-                    block = "\n".join(current_chunk_lines) + "\n\n"
-                    yield block.encode("utf-8")
+                out_block, done_block, should_stop = process_event_block(
+                    current_event_name, current_chunk_lines, ctx
+                )
+                if done_block:
+                    buffered_done_block = done_block
+                if out_block:
+                    yield out_block
                 current_chunk_lines = []
+                if should_stop:
+                    return
 
         except httpx.ReadTimeout:
             logger.warning(f"Upstream read timeout ({READ_TIMEOUT}s) reached on stream {ctx.response_id or 'unknown'}")
@@ -284,18 +319,9 @@ async def handle_streaming_responses(
                 yield synth_block
         except Exception as eval_err:
             logger.error(f"Error evaluating disconnection policy: {eval_err}", exc_info=True)
-            # Final fallback to guarantee terminal event
-            fallback_payload = {
-                "type": "response.failed",
-                "sequence_number": ctx.max_sequence_number + 1,
-                "response": {
-                    "id": ctx.response_id or "resp_fallback_err",
-                    "status": "failed",
-                    "error": {"message": f"Proxy evaluation error: {eval_err}", "type": "proxy_internal_error", "code": "proxy_eval_failed"},
-                    "output": [],
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-                }
-            }
+            fallback_payload = build_failed_payload(
+                ctx, code="proxy_eval_failed", message=f"Proxy evaluation error: {eval_err}"
+            )
             yield f"event: response.failed\ndata: {json.dumps(fallback_payload)}\n\n".encode("utf-8")
 
         # Emit buffered [DONE] after terminal event if present
