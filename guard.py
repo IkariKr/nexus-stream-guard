@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import sys
-from typing import AsyncGenerator, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
@@ -54,6 +54,7 @@ logger = logging.getLogger("NexusStreamGuard")
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://nexus.ikarikore.top")
 UPSTREAM_VERIFY = os.getenv("UPSTREAM_VERIFY", "true").lower() in ("true", "1", "yes")
 READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "600.0"))
+AUTO_SEAL_TEXT = os.getenv("AUTO_SEAL_TEXT", "true").lower() in ("true", "1", "yes")
 
 app = FastAPI(title="Nexus Stream Guard", version="1.0.0")
 
@@ -72,13 +73,14 @@ async def shutdown_event() -> None:
 
 
 @app.get("/health")
-async def health_check() -> Dict[str, str]:
+async def health_check() -> Dict[str, Any]:
     """Health check endpoint for Docker / Komodo monitoring."""
     return {
         "status": "ok",
         "service": "cliproxyapi-stream-guard",
         "version": "1.0.0",
         "upstream": UPSTREAM_BASE_URL,
+        "auto_seal_text": AUTO_SEAL_TEXT,
     }
 
 
@@ -255,6 +257,14 @@ async def handle_streaming_responses(
 
         try:
             async for raw_line in upstream_resp.aiter_lines():
+                # Client disconnection check: stop early to prevent wasted tokens
+                if await request.is_disconnected():
+                    logger.info(
+                        f"Client disconnected early on stream (resp_id={ctx.response_id or 'unknown'}, "
+                        f"model={ctx.model or requested_model})"
+                    )
+                    return
+
                 line = raw_line.strip()
                 if not line:
                     if current_chunk_lines:
@@ -307,14 +317,25 @@ async def handle_streaming_responses(
         finally:
             await upstream_resp.aclose()
 
+        # If client has already disconnected, do not synthesize or buffer anything
+        if await request.is_disconnected():
+            logger.debug(f"Skipping synthesis: client disconnected (resp_id={ctx.response_id})")
+            return
+
         # Evaluate policy and synthesize terminal event if stream closed uncleanly
         try:
-            decision = evaluate_disconnection(ctx)
+            decision = evaluate_disconnection(ctx, auto_seal_text=AUTO_SEAL_TEXT)
             if decision.action != "none" and decision.event_name and decision.payload:
+                # If prefix sealing events are needed (e.g. output_text.done, content_part.done, output_item.done)
+                for p_event, p_payload in decision.prefix_events:
+                    p_block = f"event: {p_event}\ndata: {json.dumps(p_payload)}\n\n".encode("utf-8")
+                    yield p_block
+
                 synth_block = f"event: {decision.event_name}\ndata: {json.dumps(decision.payload)}\n\n".encode("utf-8")
                 logger.info(
                     f"Stream closed without terminal event. Policy '{decision.matched_policy}' triggered -> "
-                    f"Injected {decision.event_name} (resp_id={ctx.response_id}, items={len(ctx.completed_output_items)})"
+                    f"Injected {decision.event_name} (prefix_events={len(decision.prefix_events)}, "
+                    f"resp_id={ctx.response_id}, items={len(ctx.completed_output_items)})"
                 )
                 yield synth_block
         except Exception as eval_err:

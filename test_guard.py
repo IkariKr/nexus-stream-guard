@@ -128,16 +128,53 @@ class TestNexusStreamGuardPolicies(unittest.TestCase):
         self.assertEqual(dec.payload["response"]["error"]["code"], "stream_truncated_tool_args")
         self.assertEqual(dec.payload["sequence_number"], 11)
 
-    def test_scenario_c_text_truncated(self):
+    def test_scenario_c_text_truncated_auto_seal(self):
+        ctx = StreamContext(
+            response_id="resp_txt_seal",
+            model="gemini-3.8-flash",
+            max_sequence_number=7,
+            last_event="response.output_text.delta",
+            active_output_item={"id": "msg_partial", "type": "message"},
+            active_output_index=0,
+            active_text_deltas=["Hello, ", "this is partial text."],
+        )
+        dec = evaluate_disconnection(ctx, auto_seal_text=True)
+        self.assertEqual(dec.action, "synthesize_completed")
+        self.assertEqual(dec.event_name, "response.completed")
+        self.assertEqual(dec.matched_policy, "scenario_c_auto_seal_text")
+        self.assertEqual(len(dec.prefix_events), 3)
+        self.assertEqual(dec.prefix_events[0][0], "response.output_text.done")
+        self.assertEqual(dec.prefix_events[0][1]["text"], "Hello, this is partial text.")
+        self.assertEqual(dec.prefix_events[1][0], "response.content_part.done")
+        self.assertEqual(dec.prefix_events[2][0], "response.output_item.done")
+        self.assertEqual(dec.prefix_events[2][1]["item"]["content"][0]["text"], "Hello, this is partial text.")
+        self.assertEqual(dec.payload["type"], "response.completed")
+        self.assertEqual(len(dec.payload["response"]["output"]), 1)
+
+    def test_scenario_c_text_truncated_without_auto_seal(self):
         ctx = StreamContext(
             response_id="resp_txt",
             max_sequence_number=7,
             last_event="response.output_text.delta",
+            active_text_deltas=["Partial text"],
         )
-        dec = evaluate_disconnection(ctx)
+        dec = evaluate_disconnection(ctx, auto_seal_text=False)
         self.assertEqual(dec.action, "synthesize_failed")
         self.assertEqual(dec.event_name, "response.failed")
         self.assertEqual(dec.payload["response"]["error"]["code"], "stream_truncated_text")
+
+    def test_scenario_c_text_truncated_empty_deltas_fails(self):
+        ctx = StreamContext(
+            response_id="resp_txt",
+            max_sequence_number=7,
+            last_event="response.output_text.delta",
+            active_text_deltas=["", "   "],
+        )
+        # Whitespace-only text should not be falsely auto-sealed
+        dec = evaluate_disconnection(ctx, auto_seal_text=True)
+        self.assertEqual(dec.action, "synthesize_failed")
+        self.assertEqual(dec.payload["response"]["error"]["code"], "stream_truncated_text")
+
 
     def test_scenario_d_reasoning_truncated(self):
         ctx = StreamContext(
@@ -258,7 +295,14 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
 
                 elif scenario == "scenario_c":
                     yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1}\n\n'
-                    yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":2,"delta":"Partial..."}\n\n'
+                    yield b'event: response.output_item.added\ndata: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_c","type":"message"}}\n\n'
+                    yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"delta":"Partial..."}\n\n'
+                    return
+
+                elif scenario == "scenario_c_no_text":
+                    yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1}\n\n'
+                    yield b'event: response.output_item.added\ndata: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_empty","type":"message"}}\n\n'
+                    yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"delta":""}\n\n'
                     return
 
                 elif scenario == "scenario_d":
@@ -286,6 +330,15 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
                     yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1}\n\n'
                     yield b'event: response.failed\ndata: {"type":"response.failed","sequence_number":2,"error":{"message":"quota"}}\n\n'
                     return
+
+                elif scenario == "scenario_slow":
+                    yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1}\n\n'
+                    yield b'event: response.output_item.added\ndata: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message"}}\n\n'
+                    for i in range(10):
+                        await asyncio.sleep(0.05)
+                        yield f'event: response.output_text.delta\ndata: {{"type":"response.output_text.delta","sequence_number":{3+i},"delta":"part_{i} "}}\n\n'.encode("utf-8")
+                    return
+
 
             resp_headers = {"Content-Type": "text/event-stream"}
             return StreamingResponse(gen(), media_type="text/event-stream", headers=resp_headers)
@@ -399,11 +452,27 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
         last_p = payloads[-1]
         self.assertEqual(last_p["response"]["error"]["code"], "stream_truncated_tool_args")
 
-    def test_e2e_scenario_c_text_failed(self):
+    def test_e2e_scenario_c_text_auto_sealed(self):
+        # By default AUTO_SEAL_TEXT is true -> midstream text should be cleanly sealed into completed
         events, payloads, status, _ = self._call_guard("scenario_c")
+        self.assertEqual(status, 200)
+        self.assertIn("response.output_text.done", events)
+        self.assertIn("response.content_part.done", events)
+        self.assertIn("response.output_item.done", events)
+        self.assertEqual(events[-1], "response.completed")
+        last_p = payloads[-1]
+        self.assertEqual(last_p["type"], "response.completed")
+        self.assertEqual(last_p["response"]["status"], "completed")
+        self.assertEqual(len(last_p["response"]["output"]), 1)
+        self.assertEqual(last_p["response"]["output"][0]["content"][0]["text"], "Partial...")
+
+    def test_e2e_scenario_c_no_text_fails(self):
+        # Empty text shouldn't be falsely auto-sealed
+        events, payloads, status, _ = self._call_guard("scenario_c_no_text")
         self.assertEqual(status, 200)
         self.assertEqual(events[-1], "response.failed")
         self.assertEqual(payloads[-1]["response"]["error"]["code"], "stream_truncated_text")
+
 
     def test_e2e_scenario_d_reasoning_failed(self):
         events, payloads, status, _ = self._call_guard("scenario_d")
@@ -451,7 +520,26 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
         with httpx.Client() as c:
             r = c.get("http://127.0.0.1:18397/health")
             self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json()["status"], "ok")
+            data = r.json()
+            self.assertEqual(data["status"], "ok")
+            self.assertTrue(data.get("auto_seal_text"))
+
+    def test_e2e_client_disconnect_early(self):
+        # Client connects to /v1/responses, reads 1 chunk, and disconnects immediately
+        with httpx.Client() as c:
+            with c.stream(
+                "POST",
+                "http://127.0.0.1:18397/v1/responses",
+                headers={"Authorization": "Bearer test", "Accept": "text/event-stream"},
+                json={"stream": True, "scenario": "scenario_slow"},
+            ) as resp:
+                self.assertEqual(resp.status_code, 200)
+                for line in resp.iter_lines():
+                    if "response.created" in line:
+                        break
+        # Response context closed -> client disconnected cleanly, no unhandled crash on guard server
+        time.sleep(0.2)
+
 
     def test_e2e_concurrency_isolation(self):
         results = []

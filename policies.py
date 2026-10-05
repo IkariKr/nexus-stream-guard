@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -20,10 +20,23 @@ class StreamContext:
     in_active_delta: bool = False
     error_suppressed: bool = False
 
+    # Active item tracking for midstream auto-seal
+    active_output_item: Optional[Dict[str, Any]] = None
+    active_output_index: int = 0
+    active_text_deltas: List[str] = field(default_factory=list)
+
     def has_substantive_closed_output(self) -> bool:
         """Check if substantive output items (message/function_call) are already completed."""
         closed_types = {item.get("type") for item in self.completed_output_items}
         return bool(closed_types & {"message", "function_call", "custom_tool_call"})
+
+    def has_active_text_output(self) -> bool:
+        """Check if substantive non-empty text has been received for the active output item."""
+        return bool("".join(self.active_text_deltas).strip())
+
+    def get_accumulated_text(self) -> str:
+        """Return full text accumulated so far for the active output item."""
+        return "".join(self.active_text_deltas)
 
     def record_event(self, event_name: str, payload_dict: Dict[str, Any]) -> None:
         """Update stream tracking state upon receiving an SSE event."""
@@ -44,11 +57,21 @@ class StreamContext:
         elif event_name == "response.output_item.added":
             self.in_active_delta = True
             item = payload_dict.get("item", {})
-            itype = item.get("type")
+            self.active_output_item = item if isinstance(item, dict) else {}
+            idx = payload_dict.get("output_index", 0)
+            self.active_output_index = idx if isinstance(idx, int) else 0
+            self.active_text_deltas = []
+            itype = item.get("type") if isinstance(item, dict) else None
             if itype:
                 self.item_types_seen.add(itype)
 
-        elif event_name in ("response.output_text.delta", "response.function_call_arguments.delta", "response.reasoning_summary_text.delta"):
+        elif event_name == "response.output_text.delta":
+            self.in_active_delta = True
+            delta_str = payload_dict.get("delta")
+            if isinstance(delta_str, str):
+                self.active_text_deltas.append(delta_str)
+
+        elif event_name in ("response.function_call_arguments.delta", "response.reasoning_summary_text.delta"):
             self.in_active_delta = True
 
         elif event_name == "response.output_item.done":
@@ -59,6 +82,8 @@ class StreamContext:
                 itype = item.get("type")
                 if itype:
                     self.item_types_seen.add(itype)
+            self.active_output_item = None
+            self.active_text_deltas = []
 
 
 @dataclass
@@ -67,6 +92,8 @@ class PolicyDecision:
     event_name: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
     matched_policy: str = ""
+    prefix_events: List[Tuple[str, Dict[str, Any]]] = field(default_factory=list)
+
 
 
 def _safe_sort_output_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -146,7 +173,86 @@ def build_failed_payload(ctx: StreamContext, code: str, message: str) -> Dict[st
     }
 
 
-def evaluate_disconnection(ctx: StreamContext) -> PolicyDecision:
+def seal_active_text_output(ctx: StreamContext) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+    """Synthesize sealing events for midstream truncated text output item.
+    
+    Generates:
+    1. response.output_text.done (with full accumulated text)
+    2. response.content_part.done
+    3. response.output_item.done (with completed message object)
+    
+    Returns:
+        (prefix_events_to_emit, completed_item_dict)
+    """
+    accumulated_text = ctx.get_accumulated_text()
+    active_item = ctx.active_output_item or {}
+    item_id = active_item.get("id") or f"msg_synth_{int(time.time() * 1000)}"
+    output_idx = ctx.active_output_index
+    
+    seq = ctx.max_sequence_number + 1
+    text_done_payload = {
+        "type": "response.output_text.done",
+        "sequence_number": seq,
+        "output_index": output_idx,
+        "item_id": item_id,
+        "content_index": 0,
+        "text": accumulated_text,
+    }
+    
+    seq += 1
+    part_done_payload = {
+        "type": "response.content_part.done",
+        "sequence_number": seq,
+        "output_index": output_idx,
+        "item_id": item_id,
+        "content_index": 0,
+        "part": {
+            "type": "output_text",
+            "text": accumulated_text,
+            "annotations": [],
+        },
+    }
+    
+    completed_item = {
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": accumulated_text,
+                "annotations": [],
+            }
+        ],
+        "output_index": output_idx,
+    }
+    
+    seq += 1
+    item_done_payload = {
+        "type": "response.output_item.done",
+        "sequence_number": seq,
+        "output_index": output_idx,
+        "item": completed_item,
+    }
+    
+    # Update context sequence and completed items
+    ctx.max_sequence_number = seq
+    ctx.completed_output_items.append(completed_item)
+    ctx.in_active_delta = False
+    ctx.active_output_item = None
+    ctx.active_text_deltas = []
+    
+    prefix_events = [
+        ("response.output_text.done", text_done_payload),
+        ("response.content_part.done", part_done_payload),
+        ("response.output_item.done", item_done_payload),
+    ]
+    return prefix_events, completed_item
+
+
+
+def evaluate_disconnection(ctx: StreamContext, auto_seal_text: bool = True) -> PolicyDecision:
     """Evaluate stream state upon upstream connection closure and determine synthesis action.
     
     Priority Rules:
@@ -157,7 +263,11 @@ def evaluate_disconnection(ctx: StreamContext) -> PolicyDecision:
        is closed, do NOT synthesize completed; synthesize response.failed(stream_truncated_after_reasoning).
        Otherwise, synthesize response.completed.
     4. Scenario B (tool args truncated): function_call_arguments.delta/added -> response.failed(stream_truncated_tool_args).
-    5. Scenario C (text truncated): output_text.delta/added/done -> response.failed(stream_truncated_text).
+    5. Scenario C (text truncated):
+       - If auto_seal_text is True and substantial text was accumulated:
+         Seal the active output text item (emit output_text.done -> content_part.done -> output_item.done)
+         and synthesize response.completed so client/subagents can preserve output without crashing.
+       - Otherwise, synthesize response.failed(stream_truncated_text).
     6. Scenario D (reasoning truncated): reasoning_summary_text.delta/added -> response.failed(stream_truncated_reasoning).
     7. Scenario E (empty/premature): response.created/in_progress or no event -> response.failed(stream_empty_or_premature).
     8. Default Reject: any unmapped state -> response.failed(stream_closed_unclean_default_reject).
@@ -224,6 +334,17 @@ def evaluate_disconnection(ctx: StreamContext) -> PolicyDecision:
 
     # Priority 5: Scenario C (Text truncation)
     if last_event in ("response.output_text.delta", "response.output_item.added", "response.output_text.done", "response.content_part.done"):
+        if auto_seal_text and ctx.has_active_text_output():
+            prefix_events, _ = seal_active_text_output(ctx)
+            payload = build_completed_payload(ctx)
+            return PolicyDecision(
+                action="synthesize_completed",
+                event_name="response.completed",
+                payload=payload,
+                matched_policy="scenario_c_auto_seal_text",
+                prefix_events=prefix_events,
+            )
+
         payload = build_failed_payload(
             ctx,
             code="stream_truncated_text",
