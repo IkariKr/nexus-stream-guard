@@ -17,6 +17,13 @@ class StreamContext:
     has_terminal_event: bool = False
     is_timeout: bool = False
     item_types_seen: Set[str] = field(default_factory=set)
+    in_active_delta: bool = False
+    error_suppressed: bool = False
+
+    def has_substantive_closed_output(self) -> bool:
+        """Check if substantive output items (message/function_call) are already completed."""
+        closed_types = {item.get("type") for item in self.completed_output_items}
+        return bool(closed_types & {"message", "function_call", "custom_tool_call"})
 
     def record_event(self, event_name: str, payload_dict: Dict[str, Any]) -> None:
         """Update stream tracking state upon receiving an SSE event."""
@@ -35,12 +42,17 @@ class StreamContext:
             self.created_at = resp_obj.get("created_at", self.created_at)
 
         elif event_name == "response.output_item.added":
+            self.in_active_delta = True
             item = payload_dict.get("item", {})
             itype = item.get("type")
             if itype:
                 self.item_types_seen.add(itype)
 
+        elif event_name in ("response.output_text.delta", "response.function_call_arguments.delta", "response.reasoning_summary_text.delta"):
+            self.in_active_delta = True
+
         elif event_name == "response.output_item.done":
+            self.in_active_delta = False
             item = payload_dict.get("item")
             if isinstance(item, dict):
                 self.completed_output_items.append(item)
@@ -140,7 +152,7 @@ def evaluate_disconnection(ctx: StreamContext) -> PolicyDecision:
     Priority Rules:
     1. If a terminal event was already received (completed/failed/incomplete), do nothing.
     2. If disconnection is caused by idle timeout, always synthesize response.failed(idle_timeout).
-    3. Scenario A: last_event == response.output_item.done ->
+    3. Scenario A: last_event == response.output_item.done OR trailing error suppressed ->
        Apply heuristic: if only reasoning items are closed and no message or function_call
        is closed, do NOT synthesize completed; synthesize response.failed(stream_truncated_after_reasoning).
        Otherwise, synthesize response.completed.
@@ -169,10 +181,10 @@ def evaluate_disconnection(ctx: StreamContext) -> PolicyDecision:
 
     last_event = ctx.last_event
 
-    # Priority 3: Scenario A
-    if last_event == "response.output_item.done":
+    # Priority 3: Scenario A (output_item.done OR trailing EOF error suppressed after closed substantive item)
+    if last_event == "response.output_item.done" or (ctx.error_suppressed and ctx.has_substantive_closed_output() and not ctx.in_active_delta):
+        has_substantive = ctx.has_substantive_closed_output()
         closed_types = {item.get("type") for item in ctx.completed_output_items}
-        has_substantive = bool(closed_types & {"message", "function_call", "custom_tool_call"})
         only_reasoning = ("reasoning" in closed_types) and not has_substantive
 
         if only_reasoning:

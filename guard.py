@@ -183,6 +183,50 @@ async def handle_streaming_responses(
                 line = raw_line.strip()
                 if not line:
                     if current_chunk_lines:
+                        # Check for non-standard "event: error" (e.g. CLIProxyAPI's unexpected EOF on closed stream)
+                        if current_event_name == "error":
+                            if ctx.has_substantive_closed_output() and not ctx.in_active_delta:
+                                logger.info(
+                                    f"Suppressed false-positive trailing 'event: error' block after completed substantive output "
+                                    f"[resp_id={ctx.response_id}, items={len(ctx.completed_output_items)}]"
+                                )
+                                ctx.error_suppressed = True
+                                current_chunk_lines = []
+                                current_event_name = ""
+                                continue
+                            else:
+                                # Real failure during mid-stream: normalize into standard response.failed
+                                logger.warning(
+                                    f"Upstream emitted 'event: error' during active stream. Normalizing to response.failed."
+                                )
+                                err_msg = "Upstream stream error"
+                                err_code = "upstream_stream_error"
+                                for el in current_chunk_lines:
+                                    if el.startswith("data:"):
+                                        try:
+                                            p = json.loads(el[5:].strip())
+                                            err_msg = p.get("message") or p.get("error", {}).get("message") or err_msg
+                                            err_code = p.get("code") or p.get("error", {}).get("code") or err_code
+                                        except Exception:
+                                            pass
+                                norm_failed = {
+                                    "type": "response.failed",
+                                    "sequence_number": ctx.max_sequence_number + 1,
+                                    "response": {
+                                        "id": ctx.response_id or "resp_failed_norm",
+                                        "status": "failed",
+                                        "error": {"message": err_msg, "type": "upstream_stream_error", "code": err_code},
+                                        "model": ctx.model or "unknown",
+                                        "output": ctx.completed_output_items,
+                                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                                    }
+                                }
+                                ctx.has_terminal_event = True
+                                yield f"event: response.failed\ndata: {json.dumps(norm_failed)}\n\n".encode("utf-8")
+                                current_chunk_lines = []
+                                current_event_name = ""
+                                continue
+
                         block = "\n".join(current_chunk_lines) + "\n\n"
                         # If block is solely [DONE], buffer it to output after any synthetic terminal event
                         if len(current_chunk_lines) == 1 and current_chunk_lines[0] == "data: [DONE]":
@@ -207,10 +251,13 @@ async def handle_streaming_responses(
                             pass
 
             if current_chunk_lines:
-                block = "\n".join(current_chunk_lines) + "\n\n"
-                if len(current_chunk_lines) == 1 and current_chunk_lines[0] == "data: [DONE]":
-                    buffered_done_block = block.encode("utf-8")
+                if current_event_name == "error" and ctx.has_substantive_closed_output() and not ctx.in_active_delta:
+                    logger.info("Suppressed false-positive trailing 'event: error' block in final chunk.")
+                    ctx.error_suppressed = True
+                elif len(current_chunk_lines) == 1 and current_chunk_lines[0] == "data: [DONE]":
+                    buffered_done_block = "\n".join(current_chunk_lines).encode("utf-8") + b"\n\n"
                 else:
+                    block = "\n".join(current_chunk_lines) + "\n\n"
                     yield block.encode("utf-8")
                 current_chunk_lines = []
 

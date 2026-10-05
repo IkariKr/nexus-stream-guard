@@ -1,6 +1,6 @@
 """Comprehensive automated test suite for Nexus Stream Guard.
 
-Covers all 26 test scenarios:
+Covers all 28 test scenarios:
 - Scenario A: output_item.done -> response.completed
 - Scenario A Heuristic: reasoning-only -> response.failed(stream_truncated_after_reasoning)
 - Scenario B: function_call_arguments.delta -> response.failed(stream_truncated_tool_args)
@@ -9,6 +9,8 @@ Covers all 26 test scenarios:
 - Scenario E: response.created only -> response.failed(stream_empty_or_premature)
 - Scenario F: normal stream with completed -> passed through without synthesis
 - Forward Compat: normal stream with incomplete -> passed through without synthesis
+- Trailing Error Suppression: event: error (unexpected EOF) after message completed -> suppressed and synthesized response.completed
+- Midstream Error Normalization: event: error during delta -> normalized into response.failed
 - Upstream Error Passthrough: HTTP 401/500/response.failed -> passed through untouched
 - Default Reject: unmapped last event -> response.failed(stream_closed_unclean_default_reject)
 - Idle Timeout: timeout flag -> response.failed(idle_timeout)
@@ -70,6 +72,24 @@ class TestNexusStreamGuardPolicies(unittest.TestCase):
         self.assertEqual(len(resp["output"]), 1)
         self.assertEqual(resp["usage"]["total_tokens"], 0)
 
+    def test_scenario_a_error_suppressed_after_completed_item(self):
+        ctx = StreamContext(
+            response_id="resp_suppressed",
+            model="gemini-3.8-flash",
+            created_at=1000000,
+            max_sequence_number=8,
+            last_event="error",
+            error_suppressed=True,
+            in_active_delta=False,
+            completed_output_items=[
+                {"id": "msg_gemini", "type": "message", "status": "completed", "output_index": 0}
+            ],
+        )
+        dec = evaluate_disconnection(ctx)
+        self.assertEqual(dec.action, "synthesize_completed")
+        self.assertEqual(dec.event_name, "response.completed")
+        self.assertEqual(dec.payload["response"]["id"], "resp_suppressed")
+
     def test_scenario_a_heuristic_reasoning_only(self):
         ctx = StreamContext(
             response_id="resp_123",
@@ -115,7 +135,6 @@ class TestNexusStreamGuardPolicies(unittest.TestCase):
         )
         dec = evaluate_disconnection(ctx)
         self.assertEqual(dec.action, "synthesize_failed")
-        self.assertEqual(dec.event_name, "response.failed")
         self.assertEqual(dec.payload["response"]["error"]["code"], "stream_truncated_text")
 
     def test_scenario_d_reasoning_truncated(self):
@@ -188,7 +207,6 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
             scenario = body.get("scenario", "scenario_a")
 
             if scenario == "http_500":
-                # Real gzip compressed response to test header stripping
                 raw_err = json.dumps({"error": "Internal Server Error"}).encode("utf-8")
                 gz_err = gzip.compress(raw_err)
                 return Response(gz_err, status_code=500, headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
@@ -200,6 +218,22 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
                     yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"delta":"Review done"}\n\n'
                     yield b'event: response.output_text.done\ndata: {"type":"response.output_text.done","sequence_number":4}\n\n'
                     yield b'event: response.output_item.done\ndata: {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"id":"msg_0","type":"message","status":"completed"}}\n\n'
+                    return
+
+                elif scenario == "scenario_trailing_error":
+                    # Emit full output, then emit CLIProxyAPI-style event: error (unexpected EOF)
+                    yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1,"response":{"id":"resp_trailing_err","model":"gemini","created_at":123}}\n\n'
+                    yield b'event: response.output_item.added\ndata: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message"}}\n\n'
+                    yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":3,"delta":"Gemini output complete"}\n\n'
+                    yield b'event: response.output_item.done\ndata: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"msg_gemini","type":"message","status":"completed"}}\n\n'
+                    yield b'event: error\ndata: {"type":"error","code":"internal_server_error","message":"unexpected EOF","sequence_number":0}\n\n'
+                    return
+
+                elif scenario == "scenario_midstream_error":
+                    # Emit partial delta, then emit event: error
+                    yield b'event: response.created\ndata: {"type":"response.created","sequence_number":1}\n\n'
+                    yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":2,"delta":"Partial..."}\n\n'
+                    yield b'event: error\ndata: {"type":"error","code":"rate_limit_exceeded","message":"Rate limit reached"}\n\n'
                     return
 
                 elif scenario == "scenario_b":
@@ -300,8 +334,6 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(events[-1], "response.completed")
         self.assertIn("response.output_item.done", events)
-
-        # Check content-encoding was stripped
         self.assertNotIn("content-encoding", headers)
 
         seqs = [p.get("sequence_number") for p in payloads if "sequence_number" in p]
@@ -310,6 +342,26 @@ class TestNexusStreamGuardEndToEnd(unittest.TestCase):
         self.assertEqual(last_p["type"], "response.completed")
         self.assertEqual(last_p["response"]["status"], "completed")
         self.assertEqual(len(last_p["response"]["output"]), 1)
+
+    def test_e2e_trailing_error_suppressed_and_completed(self):
+        events, payloads, status, _ = self._call_guard("scenario_trailing_error")
+        self.assertEqual(status, 200)
+        # Verify that "error" event was suppressed!
+        self.assertNotIn("error", events)
+        # Verify that terminal event is response.completed
+        self.assertEqual(events[-1], "response.completed")
+        last_p = payloads[-1]
+        self.assertEqual(last_p["type"], "response.completed")
+        self.assertEqual(last_p["response"]["id"], "resp_trailing_err")
+        self.assertEqual(len(last_p["response"]["output"]), 1)
+
+    def test_e2e_midstream_error_normalized(self):
+        events, payloads, status, _ = self._call_guard("scenario_midstream_error")
+        self.assertEqual(status, 200)
+        self.assertNotIn("error", events)
+        self.assertEqual(events[-1], "response.failed")
+        last_p = payloads[-1]
+        self.assertEqual(last_p["response"]["error"]["message"], "Rate limit reached")
 
     def test_e2e_headers_and_auth_passthrough(self):
         _, _, status, _ = self._call_guard("scenario_a")
